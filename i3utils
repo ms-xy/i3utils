@@ -16,16 +16,29 @@ def getWorkspaces():
   return json.loads(subprocess.getoutput("i3-msg -t get_workspaces"))
 
 
-def switchToWorkspaceNumber(num):
-  subprocess.run(["i3-msg", "workspace", "number", "{:d}".format(num)])
-
-def switchToWorkspaceByPrefixNumber(num):
+def getPrefixNumberMatchingWorkspace(num):
   workspaces = getWorkspaces()
   regex = re.compile("^{}(:.*)?$".format(num))
   for workspace in workspaces:
     if regex.match(workspace['name']):
-      switchToWorkspaceNumber(workspace['num'])
-      break
+      return workspace
+  return None
+
+
+def switchToWorkspaceByPrefixNumber(num):
+  workspace = getPrefixNumberMatchingWorkspace(num)
+  if workspace:
+    subprocess.run(["i3-msg", "workspace", "number", "{}".format(num)])
+  else:
+    subprocess.run(["i3-msg", "workspace", "{}".format(num)])
+
+
+def moveContainerToWorkspaceByPrefixNumber(num):
+  workspace = getPrefixNumberMatchingWorkspace(num)
+  if workspace:
+    subprocess.run(["i3-msg", "move", "container", "to", "workspace", "number", "{}".format(workspace["num"])])
+  else:
+    subprocess.run(["i3-msg", "move", "container", "to", "workspace", "{}".format(num)])
 
 
 def setWorkspaceTitle(name):
@@ -42,6 +55,10 @@ def parseCommands(args):
     "title": {
       "args": 1,
       "fn": setWorkspaceTitle
+    },
+    "moveto": {
+      "args": 1,
+      "fn": moveContainerToWorkspaceByPrefixNumber
     }
   }
   commands = []
