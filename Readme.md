@@ -16,3 +16,9 @@ To set the title of the current workspace use:
 ```bash
 i3utils title "2: my special workspace with a title"
 ```
+
+Move the current container to a (number prefixed) workspace:
+
+```bash
+i3utils moveto 1
+```
