@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+
+# i3utils - a small helper script for the awesome i3 window manager
+#
+# Currently this helper script can only help switching to (prefixed) workspaces
+#
+# Copyright 2018, Maximilian Schott
+# Licensed under AGPL-3.0, see LICENSE.txt at github.com/ms-xy/i3utils/LICENSE.txt
+
+import json
+import re
+import subprocess
+import sys
+
+def getWorkspaces():
+  return json.loads(subprocess.getoutput("i3-msg -t get_workspaces"))
+
+
+def switchToWorkspaceNumber(num):
+  subprocess.run(["i3-msg", "workspace", "number", "{:d}".format(num)])
+
+def switchToWorkspaceByPrefixNumber(num):
+  workspaces = getWorkspaces()
+  regex = re.compile("^{}(:.*)?$".format(num))
+  for workspace in workspaces:
+    if regex.match(workspace['name']):
+      switchToWorkspaceNumber(workspace['num'])
+      break
+
+
+def setWorkspaceTitle(name):
+  subprocess.run(["i3-msg", "-q", 'rename workspace to "{}"'.format(name)])
+
+
+def parseCommands(args):
+  i = 0
+  known_commands = {
+    "switch": {
+      "args": 1,
+      "fn": switchToWorkspaceByPrefixNumber
+    },
+    "title": {
+      "args": 1,
+      "fn": setWorkspaceTitle
+    }
+  }
+  commands = []
+  while i < len(args):
+    if args[i] in known_commands:
+      cmd_spec = known_commands[args[i]]
+      cmd_args = args[i+1:i+1+cmd_spec["args"]]
+      commands.append({
+        "fn": cmd_spec["fn"],
+        "args": cmd_args
+      })
+      i = i+1+cmd_spec["args"]
+  return commands
+
+
+## ---
+##
+def main():
+  commands = parseCommands(sys.argv[1:])
+  for command in commands:
+    command["fn"](*command["args"])
+##
+## ---
+
+if __name__ == "__main__":
+  main()
