@@ -1,4 +1,4 @@
-### i3utils
+# i3utils
 
 Small python3 helper program leveraging i3-msg.
 
@@ -37,7 +37,7 @@ in your window manager for ease of access):
 i3utils ui
 ```
 
-# GUI Commands
+## GUI Commands
 
 ```bash
 sleep
@@ -80,7 +80,7 @@ title 2: my workspace
 
 Set the workspace title. Works just like the CLI.
 
-### inet
+# inet
 
 Small python3 helper wrapping around the cumbersome NetworkManager CLI (nmcli).
 It is designed to increase workflow speed for a few simple tasks when using
