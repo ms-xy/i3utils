@@ -9,77 +9,295 @@
 
 import json
 import re
+import shlex
 import subprocess
 import sys
+import os
+from helpers.streams import ListStream
+from helpers.window import BaseWindow, MessageWindow
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gtk, Gdk
+
 
 def getWorkspaces():
   return json.loads(subprocess.getoutput("i3-msg -t get_workspaces"))
 
 
+def getActiveWorkspace():
+  workspaces = getWorkspaces()
+  for workspace in workspaces:
+    if workspace['focused'] is True:
+      return workspace
+  return None
+
+
 def getPrefixNumberMatchingWorkspace(num):
   workspaces = getWorkspaces()
-  regex = re.compile("^{}(:.*)?$".format(num))
+  regex = re.compile("^[ \t]*{}.*$".format(num))
   for workspace in workspaces:
     if regex.match(workspace['name']):
       return workspace
   return None
 
 
-def switchToWorkspaceByPrefixNumber(num):
-  workspace = getPrefixNumberMatchingWorkspace(num)
-  if workspace:
-    subprocess.run(["i3-msg", "workspace", "number", "{}".format(num)])
+def command_switch(args):
+  if not args.hasNext():
+    raise Exception("switch: missing argument workspace-number")
   else:
-    subprocess.run(["i3-msg", "workspace", "{}".format(num)])
+    num = args.next()
+    workspace = getPrefixNumberMatchingWorkspace(num)
+    if workspace:
+      subprocess.run(["i3-msg", "workspace", "number", "{}".format(workspace["num"])]).check_returncode()
+    else:
+      subprocess.run(["i3-msg", "workspace", "{}".format(num)]).check_returncode()
+    return True
 
 
-def moveContainerToWorkspaceByPrefixNumber(num):
-  workspace = getPrefixNumberMatchingWorkspace(num)
-  if workspace:
-    subprocess.run(["i3-msg", "move", "container", "to", "workspace", "number", "{}".format(workspace["num"])])
+def command_moveto(args):
+  if not args.hasNext():
+    raise Exception("moveto: missing argument workspace-number")
   else:
-    subprocess.run(["i3-msg", "move", "container", "to", "workspace", "{}".format(num)])
+    num = args.next()
+    workspace = getPrefixNumberMatchingWorkspace(num)
+    if workspace:
+      subprocess.run(["i3-msg", "move", "container", "to", "workspace", "number", "{}".format(workspace["num"])]).check_returncode()
+    else:
+      subprocess.run(["i3-msg", "move", "container", "to", "workspace", "{}".format(num)]).check_returncode()
+    return True
 
 
-def setWorkspaceTitle(name):
-  subprocess.run(["i3-msg", "-q", 'rename workspace to "{}"'.format(name)])
+def command_title(args):
+  if not args.hasNext():
+    raise Exception("title: missing argument(s) (you should provide a title word or string if you want to set the workspace title!)")
+  else:
+    name = " ".join(args.toList()).strip()
+    workspace = getActiveWorkspace()
+    if workspace:
+      number = workspace['num']
+      if number:
+        regex = re.compile("^0*\\d+.*$")
+        if not regex.match(name):
+          name = "{}: {}".format(number, name)
+    subprocess.run(["i3-msg", "-q", 'rename workspace to " {} "'.format(name)]).check_returncode()
+    return True
 
 
-def parseCommands(args):
-  i = 0
-  known_commands = {
-    "switch": {
-      "args": 1,
-      "fn": switchToWorkspaceByPrefixNumber
-    },
-    "title": {
-      "args": 1,
-      "fn": setWorkspaceTitle
-    },
-    "moveto": {
-      "args": 1,
-      "fn": moveContainerToWorkspaceByPrefixNumber
-    }
-  }
-  commands = []
-  while i < len(args):
-    if args[i] in known_commands:
-      cmd_spec = known_commands[args[i]]
-      cmd_args = args[i+1:i+1+cmd_spec["args"]]
-      commands.append({
-        "fn": cmd_spec["fn"],
-        "args": cmd_args
-      })
-      i = i+1+cmd_spec["args"]
-  return commands
+# Custom UI classes
+class ErrorWindow(MessageWindow):
+  def __init__ (self, errMsg):
+    super().__init__("ERROR", errMsg)
+
+class CommandInputWindow(BaseWindow):
+  def __init__ (self):
+    super().__init__()
+    # add entry
+    self.entry = Gtk.Entry()
+    self.entry.set_activates_default(True)
+    self.entry.set_editable(True)
+    self.entry.set_placeholder_text("command")
+    self.entry.set_width_chars(50)
+    self.entry.connect("activate", self.processentry_activate)
+    self.win.add(self.entry)
+
+  def processentry_activate (self, entry):
+    command = self.entry.get_text()
+    Gtk.main_quit()
+
+    if command in ["sleep", "suspend", "z"]:
+      # append option "-u" for hiding the input indicator of i3lock
+      subprocess.run(["i3lock", "-c", "000000", "-p", "win"]).check_returncode()
+      subprocess.run(["systemctl", "suspend"]).check_returncode()
+
+    elif command in ["shutdown", "poweroff"]:
+      subprocess.run(["systemctl", "poweroff"]).check_returncode()
+
+    elif command in ["reboot", "restart"]:
+      subprocess.run(["systemctl", "reboot"]).check_returncode()
+
+    elif command.startswith("display "):
+      parts = command.split()
+      if len(parts) > 1:
+        displayName = parts[1]
+        if len(parts) > 2:
+          requestedMode = parts[2]
+        else:
+          requestedMode = None
+
+        # split display name, determine if a expected number is given
+        parts = displayName.upper().rsplit("-", 1)
+        displayName = parts[0]
+        if len(parts) == 1:
+          displayNumber = "1" # by default take the first display available
+        else:
+          displayNumber = parts[1]
+
+        # query xrandr status for parsing
+        stdout = subprocess.getoutput("xrandr --query")
+        availableDisplays = {}
+        skipScreens = True
+        name = ""
+        number = 1
+        primary = None
+
+        for line in stdout.split("\n"):
+          # skip all lines describing x-screens at the start of the output
+          if skipScreens and line.startswith("Screen "):
+            continue
+          skipScreens = False
+
+          # process display mode lines, check if one is active
+          if line.startswith(" "):
+            if name != "":
+              mode = line.strip().split(" ",1)[0]
+              if line[22] == '*': # would be interesting to know if the xrandr output is always the same?
+                availableDisplays[name][number]["mode"] = mode
+              if line[23] == '+':
+                availableDisplays[name][number]["preferred"] = mode
+
+          # process display info lines
+          else:
+            parts = line.split()
+            identifiers = parts[0].rsplit("-", 1)
+            name = identifiers[0]
+            number = identifiers[1]
+            isConnected = parts[1]
+
+            if parts[2] == "primary":
+              primary = (name, number)
+
+            if not name in availableDisplays:
+              availableDisplays[name] = {}
+
+            availableDisplays[name][number] = {
+              "connected": (isConnected == "connected"),
+              "mode": None,
+              "preferred": None
+            }
+
+        if not displayName in availableDisplays:
+          raise Exception("requested display was not found (name)")
+
+        else:
+          displayInfos = availableDisplays[displayName]
+          if not displayNumber in displayInfos:
+            raise Exception("requested display was not found (number)")
+
+          else:
+            displayInfo = displayInfos[displayNumber]
+            if requestedMode == "off":
+              # attempt to disable is always possible, even if disconnected (which does not prohibit it from being virtually served)
+              subprocess.run(["xrandr", "--output", "{}-{}".format(displayName, displayNumber), "--off"]).check_returncode()
+
+            elif not displayInfo["connected"]:
+              # any other mode of operation requires it to be connected though
+              raise Exception("requested display is not connected")
+
+            else:
+              # check if default mode (preferred mode) should be selected for the display
+              if not requestedMode:
+                requestedMode = displayInfo["preferred"]
+              # set mode
+              args = ["xrandr", "--output", "{}-{}".format(displayName, displayNumber), "--mode", requestedMode]
+              if primary:
+                args = args + ["--above", "{}-{}".format(primary[0], primary[1])]
+              subprocess.run(args).check_returncode()
+
+    elif command.startswith("title "):
+      command_title(ListStream(command.split()[1:]))
+
+    elif command.startswith("inet "):
+      subprocess.run(shlex.split(command)).check_returncode()
+
+    elif command.startswith("wallpaper"):
+      command_wallpaper(ListStream(command.split()[1:]))
+
+    else:
+      raise Exception("Unknown command '{}'".format(command))
+
+
+def command_ui(args):
+  app = CommandInputWindow()
+  app.run()
+  return True
+
+
+def command_wallpaper(args):
+  folder = "~/wallpapers"
+  random = True
+  file = ""
+  if args.hasNext():
+    folder = args.next()
+  if args.hasNext():
+    random = False
+    file = args.next()
+  if random:
+    image = subprocess.getoutput("find ~/wallpapers/ | shuf -n1")
+  else:
+    image = folder+"/"+file
+  env = os.environ.copy()
+  env["DISPLAY"] = ":0"
+  subprocess.run(["feh", "--bg-fill", image], env=env).check_returncode()
+  return True
 
 
 ## ---
 ##
+known_commands = {
+  "switch":     {
+    "fn":   command_switch,
+    "help": "Switches to the given workspace number. Takes one argument."
+  },
+  "moveto":     {
+    "fn":   command_moveto,
+    "help": "Move the currently active window to the given workspace number. Takes one argument."
+  },
+  "title":      {
+    "fn":   command_title,
+    "help": "Sets the title/name of the current workspace. Eats all remaining arguments. Workspace title should either be a number or have the format '<number>: <text>'."
+  },
+  "ui":         {
+    "fn":   command_ui,
+    "help": "Opens the command ui. Takes no arguments."
+  },
+  "wallpaper":  {
+    "fn":   command_wallpaper,
+    "help": "Sets the desktop wallpaper. Has two optional positional arguments: folderpath and filename. If no argument is given, folder defaults to ~/wallpapers. If one argument is given, file is chosen randomly. Requires program 'feh'."
+  }
+}
+
+def getCommand(args):
+  global known_commands
+  i = 0
+  while args.hasNext():
+    command = args.next()
+    if command in known_commands:
+      return known_commands[command]["fn"]
+    else:
+      raise Exception("Unknown i3utils argument '{}'".format(command))
+
 def main():
-  commands = parseCommands(sys.argv[1:])
-  for command in commands:
-    command["fn"](*command["args"])
+  global known_commands
+  if any(x in sys.argv[1:] for x in ['help', '-h', '--help']):
+    helpText = "Available commands:\n{}".format(
+      "\n".join(["\t{} - {}".format(command, known_commands[command]["help"]) for command in list(known_commands.keys())])
+    )
+    MessageWindow("Help", helpText).run()
+    return
+
+  args = ListStream(sys.argv[1:])
+  while args.hasNext():
+    try:
+      command = getCommand(args)
+      if not command or not command(args):
+        return # no further commands available / command did not return true => stop execution
+    except Exception as e:
+      if isinstance(e, subprocess.CalledProcessError):
+        e = "'{0.cmd}' failed with returncode='{0.returncode}', stdout='{0.stdout}', stderr='{0.stderr}'".format(err)
+      ErrorWindow("{}".format(e)).run()
+      return # also stop execution if an exception happened
 ##
 ## ---
 

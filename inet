@@ -1,0 +1,330 @@
+#!/usr/bin/python3 -u
+
+# ---
+## provide exec function
+# ---
+
+import subprocess
+import threading
+import os
+import io
+import select
+
+class PipeWrapper (threading.Thread):
+  def __init__ (self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._r_fd, self._w_fd = os.pipe()
+    self._buffer = io.StringIO()
+    self.start()
+  def fileno (self):
+    return self._w_fd
+  def read (self, n):
+    return os.read(self._r_fd, n)
+  def write (self, data):
+    return os.write(self._w_fd, data)
+  def close (self):
+    self._running = False
+    os.close(self._w_fd)
+    os.close(self._r_fd)
+  def gather (self):
+    self.close()
+    return self._buffer.getvalue().strip()
+  def run (self):
+    p = select.poll()
+    p.register(self._r_fd)
+    self._running = True
+    while self._running:
+      l_event = p.poll()
+      for (_, event) in l_event:
+        # incoming data
+        if event&select.POLLIN or event&select.POLLPRI:
+          while True:
+            b = self.read(0x1000)
+            if len(b) == 0:
+              break
+            self._buffer.write(b.decode("utf-8"))
+        if event&select.POLLHUP or event&select.POLLERR or event&select.POLLNVAL:
+          self._running=False
+          break
+
+def exec (*args, check=True):
+  stdout = PipeWrapper()
+  cp = subprocess.run(args, stdout=stdout, stderr=stdout, universal_newlines=True)
+  if check and cp.returncode != 0:
+    logging.error(ERROR_CHILD_PROCESS_ERROR.format(cp.args, cp.returncode, stdout.gather()))
+    sys.exit(1)
+  return cp, stdout.gather()
+
+
+# ---
+## process command line arguments
+# ---
+
+import argparse
+import sys
+
+parser = argparse.ArgumentParser(description='Internet connection utility. Requires `ip` and `nmcli` commands to be installed.')
+sub_parsers = parser.add_subparsers(dest="command")
+
+sub_parsers.add_parser("on", description="Enable the network manager")
+sub_parsers.add_parser("off", description="Disable the network manager")
+sub_parsers.add_parser("restart", description="Restarts networking and any currently active interfaces and re-establishes connections")
+
+ifup_parser = sub_parsers.add_parser("ifup", description="Enables the specified interface, enables networking if it is disabled")
+ifup_parser.add_argument("<interface>", action="store", nargs=1)
+ifdown_parser = sub_parsers.add_parser("ifdown", description="Disables the specified interface, if none is provided, disables all interfaces and disables networking")
+ifdown_parser.add_argument("<interface>", action="store", nargs='?', const=False)
+
+up_parser = sub_parsers.add_parser("up", description="Starts the specified connection")
+up_parser.add_argument("<connection>", action="store", nargs=1)
+down_parser = sub_parsers.add_parser("down", description="Stops the specified connection or if none specified given the currently active")
+down_parser.add_argument("<connection>", action="store", nargs='?', const=False)
+
+vpn_parser = sub_parsers.add_parser("vpn", description="Start the given vpn. This operation blocks until the vpn is terminated (Ctrl+C)")
+vpn_parser.add_argument("<vpn>", action="store")
+
+args = parser.parse_args(sys.argv[1:])
+
+
+# ---
+## define error output messages
+# ---
+ERROR_CHILD_PROCESS_ERROR = '''Child process `{}` exited with error code {}:
+{}'''
+
+WARNING_LIMITED_CONNECTIVITY = '''The network connectivity is limited.'''
+
+
+# ---
+## define connection helpers
+# ---
+
+import re
+
+class Connection (object):
+  def __init__ (self, name, uuid, ctype, device):
+    self.name = name
+    self.uuid = uuid
+    self.type = ctype
+    self.device = device
+  def start (self):
+    print("Starting `{}`/`{}` on device {}".format(self.name, self.uuid, self.device))
+    exec("nmcli", "connection", "up", self.uuid, "ifname", self.device)
+  def stop (self):
+    print("Stopping `{}`/`{}` on device {}".format(self.name, self.uuid, self.device))
+    exec("nmcli", "connection", "down", self.uuid)
+
+def get_active_connections ():
+  _, connections = exec("nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active")
+  connections = connections.split("\n")
+  result = []
+  for connection in connections:
+    name, uuid, ctype, device = connection.split(":")
+    result.append(Connection(name, uuid, ctype, device))
+  return result
+
+def deactivate_all_connections (active_connections=None):
+  if active_connections:
+    for connection in active_connections:
+      connection.stop()
+  else:
+    for connection in get_active_connections():
+      connection.stop()
+
+def activate_all_connections (connections):
+  for connection in connections:
+    connection.start()
+
+
+class Interface (object):
+  def __init__ (self, name, id, iftype, stati=[]):
+    self.name = name
+    self.id = id
+    self.iftype = iftype
+    self.stati = stati
+  def is_active (self):
+    return "UP" in self.stati
+  def up (self):
+    print("Starting device {}".format(self.name))
+    exec("sudo", "ip", "link", "set", self.name, "up")
+  def down (self):
+    print("Stopping device {}".format(self.name))
+    exec("sudo", "ip", "link", "set", self.name, "down")
+    exec("sudo", "ip", "addr", "flush", "dev", self.name) # might fail ?!
+
+def get_all_interfaces ():
+  _, interfaces_data = exec("ip", "link", "show")
+  i = 0
+  lines = interfaces_data.split()
+  # 1: id / 2: iface name / 3: stati / 4: rest (split by space)
+  re_base_data = re.compile("^(.+?): (.+?): <(.*?)> (.*)$")
+  # 1: link / 2: iface type / 3: rest (split by space)
+  re_details   = re.compile("^ +(.+?)/(.+?)  (.*)$")
+  result = []
+  while i < len(lines):
+    base_data = re_base_data.findall(lines[i])
+    details = re_details.findall(lines[i+1])
+    if details[1] != "loopback": # never touch loopback devices
+      result.append(Interface(base_data[1], base_data[0], details[1], base_data[2].split(" ")))
+    i += 2
+  return result
+
+def get_active_interfaces ():
+  return [iface for iface in get_all_interfaces() if iface.is_active()]
+
+def get_interface (name):
+  ifaces = [iface for iface in get_all_interfaces() if iface.name == name]
+  if len(ifaces) > 0:
+    return ifaces[0]
+  else:
+    return None
+
+def deactivate_all_interfaces (active_interfaces):
+  if active_interfaces:
+    for iface in active_interfaces:
+      iface.down()
+  else:
+    for iface in get_active_connections():
+      iface.down()
+
+def activate_all_interfaces (interfaces):
+  for iface in interfaces:
+    iface.up()
+
+
+def is_networking_enabled ():
+  _, nm_status = exec("nmcli", "networking")
+  return nm_status == "enabled"
+
+def is_fully_connected ():
+  _, net_status = exec("nmcli", "networking", "connectivity")
+  if net_status != "full":
+    return True, net_status
+  else:
+    return False, net_status
+
+def substitute_iface_shortcut (name):
+  ifaces = get_all_interfaces()
+  for iface in ifaces:
+    if name==iface.name:
+      return name
+    elif name=="eth0":
+      if iface.name.startswith("en"):
+        return iface.name
+    elif name=="wlan0":
+      if iface.name.startswith("w"):
+        return iface.name
+  return name
+
+def substitute_connection_shortcut (name):
+  _, connections = exec("nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show")
+  for connection in connections.split("\n"):
+    cname, cuuid, ctype, cdevice = connection.split(":")
+    if name==cname:
+      return cname, cuuid
+    elif name=="eth0":
+      if "ethernet" in ctype:
+        return cname, cuuid
+    elif name=="wlan0":
+      if "wireless" in ctype:
+        return cname, cuuid
+  return name, name
+
+def get_vpn_config (name):
+  if name=="vpn":
+    return "/etc/openvpn/i20.regular.ovpn"
+  if name=="zoo" or name=="zoovpn":
+    return "/etc/openvpn/i20.zoo.ovpn"
+
+
+# ---
+## run commands based on given values
+# ---
+
+import logging
+
+not_handled = False
+
+if args.command == "on":
+  if not is_networking_enabled():
+    print("Enabling network manager")
+    exec("nmcli", "networking", "on")
+  else:
+    print("Network manager already enabled")
+
+elif args.command == "off":
+  if is_networking_enabled():
+    print("Disabling networking manager")
+    exec("nmcli", "networking", "off")
+  else:
+    print("Network manager already disabled")
+
+
+elif args.command == "ifup":
+  get_interface(substitute_iface_shortcut(getattr(args, "<connection>")[0])).up()
+
+elif args.command == "ifdown":
+  connection = getattr(args, "<connection>")[0]
+  if connection:
+    get_interface(substitute_iface_shortcut(connection)).down()
+  else:
+    deactivate_all_connections()
+    exec("nmcli", "networking", "off")
+    deactivate_all_interfaces()
+
+
+elif args.command == "up":
+  if not is_networking_enabled():
+    print("Enabling network manager")
+    exec("nmcli", "networking", "on")
+  name, connection = substitute_connection_shortcut(getattr(args, "<connection>")[0])
+  print("Enabling network connection `{}`/`{}`".format(name, connection))
+  exec("nmcli", "connection", "up", connection)
+  if not is_fully_connected():
+    logging.warning(WARNING_LIMITED_CONNECTIVITY)
+
+elif args.command == "down":
+  connection = getattr(args, "<connection>")[0]
+  if connection:
+    name, connection = substitute_connection_shortcut(connection)
+    print("Disabling network connection `{}`/`{}`".format(name, connection))
+    exec("nmcli", "connection", "down", connection)
+  else:
+    deactivate_all_connections()
+
+
+elif args.command == "restart":
+  connections = get_active_connections()
+  interfaces  = get_active_interfaces()
+  deactivate_all_connections(connections)
+  print("Disabling network manager")
+  exec("nmcli", "networking", "off")
+  deactivate_all_interfaces(interfaces)
+  activate_all_interfaces(interfaces)
+  print("Enabling network manager")
+  exec("nmcli", "networking", "on")
+  activate_all_connections(connections)
+
+
+else:
+  not_handled = True
+
+
+# handle vpn
+if args.command == "vpn":
+  _, vpn_bin_path = exec("command", "-v", "openvpn")
+  vpn = getattr(args, "<vpn>")[0]
+  print("Starting vpn `{}` [execlp]".format(vpn))
+  config_file = get_vpn_config(vpn)
+  os.execlp("sudo", "openvpn", "--config", config_file)
+  logging.error("os.execlp(sudo, openvpn, --config, "+config_file+") failed!")
+  sys.exit(1)
+
+
+# print help if nothing done
+if not_handled:
+  parser.print_help()
+
+
+# ensure script stops, even in case of exception (otherwise thread might linger)
+sys.exit(0)
